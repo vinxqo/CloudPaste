@@ -5,7 +5,9 @@
  */
 
 import { reactive } from "vue";
-import { showOfflineToast, hideOfflineToast } from "../utils/offlineToast.js";
+import { showOfflineToast, hideOfflineToast } from "./offlineToast.js";
+
+const OFFLINE_DB_VERSION = 6;
 
 // 获取应用版本号
 const getAppVersion = () => {
@@ -46,33 +48,15 @@ export const pwaState = reactive({
   // 后台同步状态
   backgroundSyncSupported: false,
   syncInProgress: false,
+  ready: false,
 });
 
 // 离线存储管理
 class OfflineStorage {
   constructor() {
     this.dbName = "CloudPasteOfflineDB";
-    this.version = this.calculateDatabaseVersion(); // 基于APP_VERSION动态计算数据库版本
+    this.version = OFFLINE_DB_VERSION;
     this.db = null;
-  }
-
-  // 基于应用版本动态计算数据库版本
-  calculateDatabaseVersion() {
-    const appVersion = getAppVersion();
-
-    // 将版本号转换为数字，例如 "0.6.8" -> 608
-    const versionParts = appVersion.split(".").map((part) => parseInt(part, 10));
-    const majorVersion = versionParts[0] || 0;
-    const minorVersion = versionParts[1] || 0;
-    const patchVersion = versionParts[2] || 0;
-
-    // 计算数据库版本：主版本*1000 + 次版本*100 + 补丁版本*10 + 基础版本
-    // 例如：0.6.8 -> 0*1000 + 6*100 + 8*10 + 5 = 685
-    const baseVersion = 5; // 当前数据库结构的基础版本
-    const calculatedVersion = majorVersion * 1000 + minorVersion * 100 + patchVersion * 10 + baseVersion;
-
-    console.log(`[PWA] 计算数据库版本: ${appVersion} -> ${calculatedVersion}`);
-    return calculatedVersion;
   }
 
   // 执行数据库迁移策略
@@ -170,26 +154,71 @@ class OfflineStorage {
     }
 
     return new Promise((resolve, reject) => {
-      const request = indexedDB.open(this.dbName, this.version);
+      const openDatabase = (useExplicitVersion) => {
+        let request;
 
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => {
-        this.db = request.result;
-        resolve(this.db);
+        try {
+          request = useExplicitVersion ? indexedDB.open(this.dbName, this.version) : indexedDB.open(this.dbName);
+        } catch (error) {
+          // 当请求的版本号小于已存在版本时，IndexedDB 可能会同步抛出 VersionError
+          if (useExplicitVersion && error && error.name === "VersionError") {
+            console.warn(
+              "[PWA] 本地离线数据库版本高于当前代码要求，将跳过降级并使用现有版本继续工作"
+            );
+            return openDatabase(false);
+          }
+
+          reject(error);
+          return;
+        }
+
+        request.onerror = () => {
+          const err = request.error;
+          if (useExplicitVersion && err && err.name === "VersionError") {
+            console.warn(
+              "[PWA] 本地离线数据库版本高于当前代码要求，将跳过降级并使用现有版本继续工作"
+            );
+            return openDatabase(false);
+          }
+
+          reject(err);
+        };
+
+        request.onsuccess = () => {
+          this.db = request.result;
+
+          // 如果是使用现有版本打开，可以同步当前实际版本号，方便日志和后续检查
+          try {
+            if (!useExplicitVersion && typeof this.db.version === "number") {
+              this.version = this.db.version;
+              console.log(`[PWA] 使用现有离线数据库版本: ${this.version}`);
+            }
+          } catch {
+            // 仅用于调试，不影响功能
+          }
+
+          resolve(this.db);
+        };
+
+        if (useExplicitVersion) {
+          request.onupgradeneeded = (event) => {
+            const db = event.target.result;
+            const oldVersion = event.oldVersion;
+            const newVersion = event.newVersion;
+
+            console.log(`[PWA] 数据库升级: ${oldVersion} -> ${newVersion}`);
+
+            // 🎯 执行数据库迁移策略
+            this.performDatabaseMigration(db, oldVersion, newVersion);
+
+            console.log("[PWA] 数据库升级完成");
+          };
+        }
       };
 
-      request.onupgradeneeded = (event) => {
-        const db = event.target.result;
-        const oldVersion = event.oldVersion;
-        const newVersion = event.newVersion;
-
-        console.log(`[PWA] 数据库升级: ${oldVersion} -> ${newVersion}`);
-
-        // 🎯 执行数据库迁移策略
-        this.performDatabaseMigration(db, oldVersion, newVersion);
-
-        console.log("[PWA] 数据库升级完成");
-      };
+      // 首先尝试使用当前代码声明的版本号打开数据库；
+      // 如果遇到 VersionError，则回退为“使用现有版本”打开，避免降级错误。
+      openDatabase(true);
     });
   }
 
@@ -372,11 +401,11 @@ class OfflineStorage {
             setting.key.startsWith("user_") ||
             setting.key.startsWith("system_") ||
             setting.key.startsWith("test_") ||
-            setting.key.startsWith("s3_config_") ||
+            setting.key.startsWith("storage_config_") ||
             setting.key.startsWith("url_") ||
             setting.key.startsWith("public_file_") ||
             setting.key.startsWith("raw_paste_") ||
-            setting.key === "s3_configs_list" ||
+            setting.key === "storage_configs_list" ||
             setting.key === "url_info_cache"
           ) {
             store.delete(setting.key);
@@ -453,8 +482,7 @@ export const offlineStorage = new OfflineStorage();
 // PWA 管理器类
 class PWAManager {
   constructor() {
-    // 延迟初始化，避免构造函数中调用async函数
-    setTimeout(() => this.init(), 0);
+    this.readyPromise = this.init();
   }
 
   async init() {
@@ -487,6 +515,7 @@ class PWAManager {
     this.checkBackgroundSyncSupport();
 
     console.log("[PWA] PWA 管理器初始化完成");
+    pwaState.ready = true;
   }
 
   // 网络状态监听 - 集成offlineToast
@@ -1129,25 +1158,22 @@ export const pwaUtils = {
 // 创建PWA管理器实例
 const pwaManager = new PWAManager();
 
-// 初始化完成后绑定真实功能到pwaUtils
-setTimeout(() => {
-  // 绑定安装功能
+const bindManagerFunctions = () => {
   pwaUtils.install = () => pwaManager.installApp();
-
-  // 绑定更新功能
   pwaUtils.update = () => pwaManager.updateApp();
   pwaUtils.checkForUpdate = () => pwaManager.checkForUpdate();
-
-  // 绑定通知功能
   pwaUtils.requestNotificationPermission = () => pwaManager.requestNotificationPermission();
-
-  // 绑定Background Sync功能
   pwaUtils.registerBackgroundSync = (tag) => pwaManager.registerBackgroundSync(tag);
   pwaUtils.getBackgroundSyncStatus = () => pwaManager.getBackgroundSyncStatus();
   pwaUtils.triggerManualSync = (tag) => pwaManager.triggerManualSync(tag);
-
   console.log("[PWA] 功能绑定完成");
-}, 100);
+};
+
+pwaManager.readyPromise
+  .then(bindManagerFunctions)
+  .catch((error) => {
+    console.error("[PWA] 初始化失败，部分PWA功能不可用:", error);
+  });
 
 // 导出实例
 export { pwaManager };

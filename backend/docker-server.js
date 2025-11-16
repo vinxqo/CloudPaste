@@ -3,7 +3,6 @@
 
 // 核心依赖
 import express from "express";
-import cors from "cors";
 import sqlite3 from "sqlite3";
 import { open } from "sqlite";
 import path from "path";
@@ -18,7 +17,6 @@ import { checkAndInitDatabase } from "./src/utils/database.js";
 import app from "./src/index.js";
 import { ApiStatus } from "./src/constants/index.js";
 
-import { setExpressWebDAVHeaders } from "./src/webdav/utils/headerUtils.js";
 import { getWebDAVConfig } from "./src/webdav/auth/config/WebDAVConfig.js";
 
 // ES模块兼容性处理：获取__dirname
@@ -243,15 +241,7 @@ let isDbInitialized = false;
 // 获取WebDAV配置
 const webdavConfig = getWebDAVConfig();
 
-// CORS配置
-const corsOptions = {
-  origin: "*",
-  methods: webdavConfig.METHODS.join(","),
-  credentials: true,
-  optionsSuccessStatus: 204,
-  maxAge: 86400,
-  exposedHeaders: webdavConfig.HEADERS["Access-Control-Expose-Headers"],
-};
+// CORS 由 Hono 层统一处理；此处不再配置 Express 侧 CORS（避免重复）
 
 // ==========================================
 // 中间件和服务器配置
@@ -281,42 +271,12 @@ webdavConfig.METHODS.forEach((method) => {
 // 中间件配置（按功能分组）
 // ==========================================
 
-// 1. 基础中间件 - CORS和HTTP方法处理
+// 1. 基础中间件 - HTTP方法处理（CORS 由 Hono 统一）
 // ==========================================
-// 智能CORS处理：跳过WebDAV OPTIONS请求和根路径OPTIONS请求，让后续中间件处理
-server.use((req, res, next) => {
-  // 对于WebDAV路径和根路径的OPTIONS请求，跳过CORS自动处理
-  if (req.method === "OPTIONS" && (req.path === "/" || req.path === "/dav" || req.path.startsWith("/dav/"))) {
-    logMessage("debug", `跳过CORS处理: ${req.method} ${req.path}`);
-    return next();
-  }
-  // 其他请求使用标准CORS处理
-  cors(corsOptions)(req, res, next);
-});
 server.use(methodOverride("X-HTTP-Method-Override"));
 server.use(methodOverride("X-HTTP-Method"));
 server.use(methodOverride("X-Method-Override"));
 server.disable("x-powered-by");
-
-// WebDAV基础方法支持
-server.use((req, res, next) => {
-  if (req.path === "/dav" || req.path.startsWith("/dav/")) {
-    // 使用统一的WebDAV头部设置工具
-    setExpressWebDAVHeaders(res);
-
-    // 区分CORS预检请求和WebDAV OPTIONS请求
-    if (req.method === "OPTIONS") {
-      // 检查是否为CORS预检请求
-      const isCORSPreflight = req.headers.origin && req.headers["access-control-request-method"];
-
-      if (isCORSPreflight) {
-        // CORS预检请求：在Express层直接处理
-        return res.status(204).end();
-      }
-    }
-  }
-  next();
-});
 
 // 2. 请求体处理中间件
 // ==========================================
@@ -384,31 +344,31 @@ server.use((req, res, next) => {
 
 // 处理原始请求体（XML、二进制等）
 server.use(
-  express.raw({
-    type: ["application/xml", "text/xml", "application/octet-stream"],
-    limit: "5gb",
-    verify: (req, res, buf, encoding) => {
-      // 对于WebDAV方法，特别是MKCOL，记录详细信息以便调试
-      if ((req.method === "MKCOL" || req.method === "PUT") && buf && buf.length > 10 * 1024 * 1024) {
-        logMessage("debug", `大型WebDAV ${req.method} 请求体:`, {
-          contentType: req.headers["content-type"],
-          size: buf ? buf.length : 0,
-        });
-      }
-
-      // 安全检查：检测潜在的异常XML或二进制内容
-      if (buf && req.path.startsWith("/dav") && (req.headers["content-type"] || "").includes("xml") && buf.length > 0) {
-        // 检查是否为有效的XML开头标记，简单验证
-        const xmlStart = buf.slice(0, Math.min(50, buf.length)).toString();
-        if (!xmlStart.trim().startsWith("<?xml") && !xmlStart.trim().startsWith("<")) {
-          logMessage("warn", `可疑的XML请求体: ${req.method} ${req.path} - 内容不以XML标记开头`, {
+    express.raw({
+      type: ["application/xml", "text/xml", "application/octet-stream"],
+      limit: "5gb",
+      verify: (req, res, buf, encoding) => {
+        // 对于WebDAV方法，特别是MKCOL，记录详细信息以便调试
+        if ((req.method === "MKCOL" || req.method === "PUT") && buf && buf.length > 10 * 1024 * 1024) {
+          logMessage("debug", `大型WebDAV ${req.method} 请求体:`, {
             contentType: req.headers["content-type"],
-            bodyPreview: xmlStart.replace(/[\x00-\x1F\x7F-\xFF]/g, ".").substring(0, 30),
+            size: buf ? buf.length : 0,
           });
         }
-      }
-    },
-  })
+
+        // 安全检查：检测潜在的异常XML或二进制内容
+        if (buf && req.path.startsWith("/dav") && (req.headers["content-type"] || "").includes("xml") && buf.length > 0) {
+          // 检查是否为有效的XML开头标记，简单验证
+          const xmlStart = buf.slice(0, Math.min(50, buf.length)).toString();
+          if (!xmlStart.trim().startsWith("<?xml") && !xmlStart.trim().startsWith("<")) {
+            logMessage("warn", `可疑的XML请求体: ${req.method} ${req.path} - 内容不以XML标记开头`, {
+              contentType: req.headers["content-type"],
+              bodyPreview: xmlStart.replace(/[\x00-\x1F\x7F-\xFF]/g, ".").substring(0, 30),
+            });
+          }
+        }
+      },
+    })
 );
 
 // 处理请求体大小限制错误
@@ -429,8 +389,8 @@ server.use((err, req, res, next) => {
 
   // 处理multipart/form-data解析错误
   if (
-    err.message &&
-    (err.message.includes("Unexpected end of form") || err.message.includes("Unexpected end of multipart data") || err.message.includes("Multipart: Boundary not found"))
+      err.message &&
+      (err.message.includes("Unexpected end of form") || err.message.includes("Unexpected end of multipart data") || err.message.includes("Multipart: Boundary not found"))
   ) {
     logMessage("error", `Multipart解析错误:`, {
       method: req.method,
@@ -463,18 +423,18 @@ server.use((err, req, res, next) => {
 
 // 处理表单数据
 server.use(
-  express.urlencoded({
-    extended: true,
-    limit: "5gb",
-  })
+    express.urlencoded({
+      extended: true,
+      limit: "5gb",
+    })
 );
 
 // 处理JSON请求体
 server.use(
-  express.json({
-    type: ["application/json", "application/json; charset=utf-8", "+json", "*/json"],
-    limit: "5gb",
-  })
+    express.json({
+      type: ["application/json", "application/json; charset=utf-8", "+json", "*/json"],
+      limit: "5gb",
+    })
 );
 
 // 3. WebDAV专用中间件
@@ -519,11 +479,13 @@ server.use(async (req, res, next) => {
       }
     }
 
-    // 注入环境变量
+    if (!process.env.ENCRYPTION_SECRET) {
+      throw new Error("ENCRYPTION_SECRET 未设置，请在Docker环境变量中配置安全密钥");
+    }
+
     req.env = {
       DB: sqliteAdapter,
-      ENCRYPTION_SECRET: process.env.ENCRYPTION_SECRET || "default-encryption-key",
-      ADMIN_TOKEN_EXPIRY_DAYS: process.env.ADMIN_TOKEN_EXPIRY_DAYS || "7",
+      ENCRYPTION_SECRET: process.env.ENCRYPTION_SECRET,
     };
 
     next();
@@ -536,25 +498,6 @@ server.use(async (req, res, next) => {
 // ==========================================
 // 路由处理
 // ==========================================
-
-// 根路径WebDAV OPTIONS兼容性处理器
-// 为1Panel等客户端提供WebDAV能力发现支持
-server.options("/", (req, res) => {
-  // 返回标准WebDAV能力声明，与/dav路径保持一致
-  const headers = {
-    Allow: "OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MKCOL, COPY, MOVE, LOCK, UNLOCK, PROPPATCH",
-    DAV: "1, 2",
-    "MS-Author-Via": "DAV",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MKCOL, COPY, MOVE, LOCK, UNLOCK, PROPPATCH",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Depth, Destination, If, Lock-Token, Overwrite, X-Custom-Auth-Key",
-    "Access-Control-Expose-Headers": "DAV, Lock-Token, MS-Author-Via",
-    "Access-Control-Max-Age": "86400",
-  };
-
-  logMessage("info", "根路径WebDAV OPTIONS请求 - 客户端兼容性支持");
-  res.set(headers).status(200).end();
-});
 
 // 通配符路由 - 处理所有其他API请求
 server.use("*", async (req, res) => {
@@ -641,8 +584,8 @@ function createAdaptedRequest(expressReq) {
       }
       // 如果是XML或二进制数据，使用Buffer
       else if (
-        (contentType.includes("application/xml") || contentType.includes("text/xml") || contentType.includes("application/octet-stream")) &&
-        Buffer.isBuffer(expressReq.body)
+          (contentType.includes("application/xml") || contentType.includes("text/xml") || contentType.includes("application/octet-stream")) &&
+          Buffer.isBuffer(expressReq.body)
       ) {
         body = expressReq.body;
       }
@@ -780,9 +723,10 @@ function startMemoryMonitoring(interval = 1200000) {
   // 简单读取容器内存使用情况
   const getContainerMemory = () => {
     try {
+      const fs = require("fs");
       // 尝试读取cgroup内存使用（优先v2，回退v1）
       let usage = null,
-        limit = null;
+          limit = null;
 
       // cgroup v2
       if (fs.existsSync("/sys/fs/cgroup/memory.current")) {

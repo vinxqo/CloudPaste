@@ -4,6 +4,7 @@
 
 // ===== 核心系统 =====
 import { useGlobalMessage } from "./core/useGlobalMessage.js";
+import { useThemeMode } from "./core/useThemeMode.js";
 
 // ===== 文件预览功能 =====
 import { usePreviewRenderers } from "./file-preview/usePreviewRenderers.js";
@@ -24,10 +25,13 @@ import { useSelection } from "./ui-interaction/useSelection.js";
 import { useUIState } from "./ui-interaction/useUIState.js";
 import { useGalleryView } from "./ui-interaction/useGalleryView.js";
 import { usePhotoSwipe } from "./ui-interaction/usePhotoSwipe.js";
+import { useShareSettingsForm } from "./upload/useShareSettingsForm.js";
+import { useUploadQueue } from "./upload/useUploadQueue.js";
 
 // 重新导出所有功能
 export {
   useGlobalMessage,
+  useThemeMode,
   usePreviewRenderers,
   useFilePreviewExtensions,
   useFilePreview,
@@ -40,6 +44,8 @@ export {
   useUIState,
   useGalleryView,
   usePhotoSwipe,
+  useShareSettingsForm,
+  useUploadQueue,
 };
 
 // ===== 便捷的聚合导出 =====
@@ -150,6 +156,8 @@ export const SORT_CONFIG = {
 // ===== 默认导出 =====
 export default {
   // 单独的组合函数
+  useGlobalMessage,
+  useThemeMode,
   usePreviewRenderers,
   useFilePreviewExtensions,
   useFilePreview,
@@ -160,6 +168,8 @@ export default {
   useUIState,
   useGalleryView,
   usePhotoSwipe,
+  useShareSettingsForm,
+  useUploadQueue,
 
   // 聚合对象
   FilePreviewComposables,
